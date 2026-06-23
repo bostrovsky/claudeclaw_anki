@@ -1,0 +1,13 @@
+{
+  "modelName": "ClaudeClaw Cloze Rich",
+  "inOrderFields": ["Text", "BackExtra", "Source"],
+  "isCloze": true,
+  "css": ".card { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; font-size: 19px; line-height: 1.55; color: #1a1a1a; text-align: left; padding: 18px; background: #fafaf7; } .card.nightMode, .nightMode .card { color: #e8e8e8; background: #1e1e1e; } .cloze { font-weight: 700; color: #1d4ed8; } .nightMode .cloze { color: #93c5fd; } .extra { margin-top: 14px; padding-top: 14px; border-top: 1px solid rgba(0,0,0,0.18); font-size: 16px; color: #4b4b4b; } .nightMode .extra { color: #cbd5e1; border-top-color: rgba(255,255,255,0.18); } code { font-family: 'SF Mono', 'Fira Code', Menlo, monospace; background: rgba(0,0,0,0.06); padding: 2px 6px; border-radius: 4px; font-size: 0.92em; } .source { margin-top: 18px; padding-top: 8px; border-top: 1px dashed rgba(0,0,0,0.2); font-size: 13px; color: #6b6b6b; font-style: italic; } .nightMode .source { border-top-color: rgba(255,255,255,0.2); color: #94a3b8; }",
+  "cardTemplates": [
+    {
+      "Name": "Cloze",
+      "Front": "<div>{{cloze:Text}}</div>",
+      "Back": "<div>{{cloze:Text}}</div>{{#BackExtra}}<div class=\"extra\">{{BackExtra}}</div>{{/BackExtra}}{{#Source}}<div class=\"source\">{{Source}}</div>{{/Source}}"
+    }
+  ]
+}

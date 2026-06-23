@@ -1,0 +1,18 @@
+// Add these entries to the builtInCommands array in src/bot.ts (the one
+// passed to bot.api.setMyCommands). Each entry registers a card command
+// with Telegram so it autocompletes when the user types "/".
+{ command: 'card_help', description: '📇 Help for all Anki card commands' },
+{ command: 'pending', description: 'List pending cards awaiting approval' },
+{ command: 'cardsfromtext', description: 'Make cards from pasted text' },
+{ command: 'cardsfromvideo', description: 'Make cards from a YouTube URL' },
+{ command: 'importdoc', description: 'Import an MD / HTML / TXT file' },
+{ command: 'importdeck', description: 'Install an existing Anki deck (.apkg)' },
+{ command: 'newcard', description: 'Manually create one card' },
+{ command: 'editcard', description: 'Edit a pending card by id' },
+{ command: 'previewcard', description: 'Re-send a pending card preview' },
+
+// Also extend OWN_COMMANDS in bot.on('message:text', ...) so the text
+// handler doesn't try to send these to Claude:
+//   '/newcard', '/editcard', '/pending', '/previewcard',
+//   '/cardsfromtext', '/cardsfromvideo', '/importdeck', '/importdoc',
+//   '/cancel', '/card_help'

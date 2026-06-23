@@ -1,0 +1,33 @@
+// Add these imports near the top of src/bot.ts (with the other adapter imports):
+import {
+  approvePending,
+  approveBatch,
+  rejectPending,
+  getPendingCard,
+  updatePendingFields,
+  listPendingByAgent,
+  sendPendingPreview,
+  proposePendingCard,
+} from './anki-pending.js';
+import { importApkg } from './anki-adapters/import-apkg.js';
+import { sendCardsFromText } from './anki-adapters/text.js';
+import { sendCardsFromVideo, isYouTubeUrl } from './anki-adapters/video.js';
+import { detectDocFormat, sendCardsFromDocument } from './anki-adapters/document.js';
+import { sendImportDaveBlocks } from './anki-adapters/dave-bidding-system.js';
+import {
+  actionPickKeyboard,
+  beginDocImport,
+  deckPickKeyboard,
+  executeDocImport,
+  listExistingDecks,
+  modePickKeyboard,
+  summarizeDocForUser,
+} from './anki-adapters/doc-import.js';
+
+// Also add the db helpers used by /importdoc state machine:
+import {
+  createDocImport,
+  getActiveDocImport,
+  getDocImport,
+  updateDocImport,
+} from './db.js';

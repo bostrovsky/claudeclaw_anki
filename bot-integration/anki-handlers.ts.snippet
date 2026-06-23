@@ -1,0 +1,623 @@
+  bot.callbackQuery(/^anki-approve:(\d+)$/, async (ctx) => {
+    if (!ctx.chat || !isAuthorised(ctx.chat.id)) return;
+    const id = parseInt(ctx.match![1], 10);
+    try {
+      await ctx.answerCallbackQuery({ text: 'Approving...' });
+      const card = getPendingCard(id);
+      if (!card) {
+        await ctx.reply(`Pending card ${id} not found.`);
+        return;
+      }
+      if (card.status === 'approved') {
+        await ctx.reply(`Card ${id} was already approved (Anki note ${card.ankiNoteId}).`);
+        return;
+      }
+      const result = await approvePending(id);
+      const syncSuffix = result.syncOk ? ' Synced to AnkiWeb.' : ` (sync failed: ${result.syncError ?? 'unknown'})`;
+      await ctx.reply(`✅ Approved card ${id} → Anki note ${result.ankiNoteId}.${syncSuffix}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ err: msg, cardId: id }, 'anki approve failed');
+      await ctx.reply(`Approve failed for card ${id}: ${msg}`);
+    }
+  });
+
+  bot.callbackQuery(/^anki-reject:(\d+)$/, async (ctx) => {
+    if (!ctx.chat || !isAuthorised(ctx.chat.id)) return;
+    const id = parseInt(ctx.match![1], 10);
+    await ctx.answerCallbackQuery({ text: 'Rejecting...' });
+    const card = rejectPending(id);
+    if (!card) {
+      await ctx.reply(`Pending card ${id} not found.`);
+      return;
+    }
+    if (card.status === 'rejected') {
+      await ctx.reply(`❌ Rejected card ${id}.`);
+    } else {
+      await ctx.reply(`Card ${id} is ${card.status}; nothing to reject.`);
+    }
+  });
+
+  bot.callbackQuery(/^anki-edit:(\d+)$/, async (ctx) => {
+    if (!ctx.chat || !isAuthorised(ctx.chat.id)) return;
+    const id = parseInt(ctx.match![1], 10);
+    await ctx.answerCallbackQuery();
+    const card = getPendingCard(id);
+    if (!card) {
+      await ctx.reply(`Pending card ${id} not found.`);
+      return;
+    }
+    if (card.status === 'approved' || card.status === 'rejected') {
+      await ctx.reply(
+        `Card ${id} is ${card.status}; cannot edit. Use /newcard to propose a new one.`,
+      );
+      return;
+    }
+    await ctx.reply(
+      `Reply with the edit using:\n\`/editcard ${id} front: NEW FRONT TEXT\`\n` +
+        `or to change multiple fields, separate with newlines and the field name + colon:\n` +
+        `\`/editcard ${id}\nfront: ...\nback: ...\``,
+      { parse_mode: 'Markdown' },
+    );
+  });
+
+  bot.callbackQuery(/^anki-approve-batch:(.+)$/, async (ctx) => {
+    if (!ctx.chat || !isAuthorised(ctx.chat.id)) return;
+    const batchId = ctx.match![1];
+    await ctx.answerCallbackQuery({ text: 'Approving batch...' });
+    const pending = listPendingByBatch(batchId, 'pending');
+    if (pending.length === 0) {
+      await ctx.reply(`No pending cards left in batch ${batchId}.`);
+      return;
+    }
+    let approved = 0;
+    let failed = 0;
+    const failures: string[] = [];
+    for (const card of pending) {
+      try {
+        await approvePending(card.id);
+        approved++;
+      } catch (err: unknown) {
+        failed++;
+        failures.push(`${card.id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    const summary =
+      `Batch ${batchId}: ${approved} approved` +
+      (failed > 0 ? `, ${failed} failed:\n${failures.join('\n').slice(0, 800)}` : '.');
+    await ctx.reply(summary);
+  });
+
+  // /newcard <deck>\nfront: ...\nback: ...[\nsource: ...]\n[tags: a, b]
+  //
+  // Spec AC#6 entry point — propose a single pending card manually and
+  // immediately send the preview. The natural-language route (an agent
+  // crafting the card via prompt) lands in proposePendingCard the same
+  // way; this command just exposes the primitive directly to the user.
+  bot.command('newcard', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
+    const raw = ctx.match?.toString() ?? '';
+    const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (lines.length === 0) {
+      await ctx.reply(
+        'Usage:\n/newcard <deck>\nfront: ...\nback: ...\n[source: ...]\n[tags: a, b]',
+      );
+      return;
+    }
+    const deck = lines[0];
+    if (!deck.includes('::') && !/^[A-Za-z]/.test(deck)) {
+      await ctx.reply('First line must be the deck name (e.g. Bridge::Conventions::Stayman).');
+      return;
+    }
+    const updates: Record<string, string> = {};
+    let tags: string[] = [];
+    let currentKey: string | null = null;
+    for (const line of lines.slice(1)) {
+      const match = line.match(/^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.*)$/);
+      if (match) {
+        const fieldName = match[1].toLowerCase();
+        if (fieldName === 'tags') {
+          tags = match[2].split(/[,\s]+/).filter(Boolean);
+          currentKey = null;
+          continue;
+        }
+        currentKey = fieldName === 'front' ? 'Front'
+          : fieldName === 'back' ? 'Back'
+          : fieldName === 'source' ? 'Source'
+          : fieldName === 'text' ? 'Text'
+          : fieldName === 'extra' || fieldName === 'backextra' ? 'BackExtra'
+          : match[1];
+        updates[currentKey] = match[2];
+      } else if (currentKey) {
+        updates[currentKey] = (updates[currentKey] + '\n' + line).trim();
+      }
+    }
+    if (!updates.Front && !updates.Text) {
+      await ctx.reply('Card must include either `front:` (basic) or `text:` (cloze).');
+      return;
+    }
+    const isCloze = !!updates.Text;
+    try {
+      const card = proposePendingCard({
+        agentId: AGENT_ID,
+        deck,
+        model: isCloze ? 'ClaudeClaw Cloze Rich' : 'ClaudeClaw Basic Rich',
+        fields: updates,
+        tags,
+        sourceType: 'manual',
+        sourceCitation: updates.Source || 'Telegram /newcard',
+        chatId: ctx.chat!.id.toString(),
+      });
+      await sendPendingPreview(ctx, card);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await ctx.reply(`Could not propose card: ${msg}`);
+    }
+  });
+
+  // /editcard <id>\nfront: ...\nback: ...  — edits a pending card and re-sends preview
+  bot.command('editcard', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
+    const raw = ctx.match?.toString() ?? '';
+    const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (lines.length === 0) {
+      await ctx.reply('Usage: /editcard <id>\\nfront: NEW\\nback: NEW');
+      return;
+    }
+    const firstSpace = lines[0].search(/\s/);
+    const idStr = firstSpace > 0 ? lines[0].slice(0, firstSpace) : lines[0];
+    // P14 fix: strict numeric. parseInt('42abc') === 42 silently edited the
+    // wrong card. Reject any non-numeric trailing characters.
+    if (!/^\d+$/.test(idStr)) {
+      await ctx.reply(`Bad card id: "${idStr}". Must be a positive integer.`);
+      return;
+    }
+    const id = parseInt(idStr, 10);
+    // Reassemble field-update blocks: first line may carry trailing "field: value" after the id
+    const fieldText: string[] = [];
+    if (firstSpace > 0) fieldText.push(lines[0].slice(firstSpace + 1).trim());
+    fieldText.push(...lines.slice(1));
+    const updates: Record<string, string> = {};
+    const unrecognized: string[] = [];
+    let currentKey: string | null = null;
+    for (const line of fieldText) {
+      const match = line.match(/^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.*)$/);
+      if (match) {
+        const fieldName = match[1].toLowerCase();
+        // Normalize common lowercase tokens to Anki field names
+        currentKey = fieldName === 'front' ? 'Front'
+          : fieldName === 'back' ? 'Back'
+          : fieldName === 'source' ? 'Source'
+          : fieldName === 'text' ? 'Text'
+          : fieldName === 'extra' || fieldName === 'backextra' ? 'BackExtra'
+          : match[1];
+        updates[currentKey] = match[2];
+      } else if (currentKey) {
+        updates[currentKey] = (updates[currentKey] + '\n' + line).trim();
+      } else {
+        // No field claimed yet AND the line isn't a "key: value" — flag it
+        // so the user knows we didn't drop it silently.
+        unrecognized.push(line);
+      }
+    }
+    if (Object.keys(updates).length === 0) {
+      await ctx.reply('No field updates parsed. Use "field: value" on each line.');
+      return;
+    }
+    try {
+      const card = await editPendingAndRePreview(ctx, id, updates);
+      if (!card) {
+        await ctx.reply(`Pending card ${id} not found.`);
+        return;
+      }
+      if (unrecognized.length > 0) {
+        await ctx.reply(`Note: ignored ${unrecognized.length} line(s) before any field: ${unrecognized.slice(0, 3).join(' / ')}`);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await ctx.reply(`Edit failed: ${msg}`);
+    }
+  });
+
+  // /pending — list pending cards for this agent
+  bot.command('pending', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
+    const cards = listPendingByAgent(AGENT_ID, 25);
+    if (cards.length === 0) {
+      await ctx.reply('No pending cards.');
+      return;
+    }
+    const lines = cards.map((c) => {
+      const front = (c.fields.Front || c.fields.Text || '').replace(/\s+/g, ' ').slice(0, 60);
+      return `• #${c.id} [${c.deck}] ${front}${front.length === 60 ? '…' : ''}`;
+    });
+    // P7 fix: previously sent with parse_mode 'HTML' but the content contains
+    // raw deck names / front text with no HTML escaping. Telegram would reject
+    // or misrender if any value contained < > or &. Drop parse_mode entirely.
+    await ctx.reply(`Pending cards (${cards.length}):\n${lines.join('\n')}`);
+  });
+
+  // /cardsfromtext — first line is the deck, body is the source text.
+  // Optional flags on the deck line: " topic=<hint>" and " max=<N>".
+  bot.command('cardsfromtext', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
+    const raw = ctx.match?.toString() ?? '';
+    const lines = raw.split(/\r?\n/);
+    const header = (lines[0] ?? '').trim();
+    if (!header) {
+      await ctx.reply(
+        'Usage:\n/cardsfromtext <deck> [topic=<hint>] [max=<N>]\n<paste the source text on the lines below>',
+      );
+      return;
+    }
+    // Pull off "topic=..." and "max=..." flags from the header. Whatever is
+    // left after stripping the flags becomes the deck name.
+    let topicHint: string | undefined;
+    let maxCards: number | undefined;
+    let deckPart = header;
+    const topicMatch = deckPart.match(/\btopic=(\S.*?)(?=\s+\w+=|$)/);
+    if (topicMatch) {
+      topicHint = topicMatch[1].trim();
+      deckPart = deckPart.replace(topicMatch[0], '').trim();
+    }
+    // P14 fix: also strip any non-numeric max=... tokens so they don't leak
+    // into the deck name. Tell the user we couldn't parse it.
+    const maxNumMatch = deckPart.match(/\bmax=(\d+)\b/);
+    const maxAnyMatch = deckPart.match(/\bmax=(\S+)/);
+    if (maxNumMatch) {
+      maxCards = parseInt(maxNumMatch[1], 10);
+      deckPart = deckPart.replace(maxNumMatch[0], '').trim();
+    } else if (maxAnyMatch) {
+      await ctx.reply(`Ignoring max="${maxAnyMatch[1]}" — must be a positive integer.`);
+      deckPart = deckPart.replace(maxAnyMatch[0], '').trim();
+    }
+    const deck = deckPart.trim();
+    if (!deck) {
+      await ctx.reply('Deck name is required as the first token of the first line.');
+      return;
+    }
+    const sourceText = lines.slice(1).join('\n').trim();
+    if (sourceText.length < 40) {
+      await ctx.reply('Source text is empty or too short. Paste the content on the lines below the deck header.');
+      return;
+    }
+    try {
+      await ctx.reply(`Drafting cards from ~${sourceText.length} chars into ${deck}…`);
+      await sendCardsFromText(ctx, sourceText, {
+        deck,
+        sourceLabel: `Pasted text · ${deck}`,
+        sourceType: 'text-paste',
+        topicHint,
+        maxCards,
+        agentId: AGENT_ID,
+        chatId: ctx.chat!.id.toString(),
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ err: msg, deck }, 'cards-from-text failed');
+      await ctx.reply(`Could not draft cards: ${msg}`);
+    }
+  });
+
+  // /cardsfromvideo <YouTube URL> <deck> [topic=...] [max=N]
+  // Gemini reads the video natively — no yt-dlp/Whisper pipeline on our
+  // side. Cards land in the pending queue with Canvas previews. Parallel
+  // to /cardsfromtext for the text-input case.
+  bot.command('cardsfromvideo', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
+    const raw = (ctx.match?.toString() ?? '').trim();
+    if (!raw) {
+      await ctx.reply(
+        'Usage: /cardsfromvideo <YouTube URL> <deck> [topic=<hint>] [max=<N>]\n' +
+          'Example: /cardsfromvideo https://youtu.be/abc123 Bridge::Stayman max=8',
+      );
+      return;
+    }
+    // Pull off topic= and max= flags
+    let topicHint: string | undefined;
+    let maxCards: number | undefined;
+    let rest = raw;
+    const topicMatch = rest.match(/\btopic=(\S.*?)(?=\s+\w+=|$)/);
+    if (topicMatch) {
+      topicHint = topicMatch[1].trim();
+      rest = rest.replace(topicMatch[0], '').trim();
+    }
+    const maxMatch = rest.match(/\bmax=(\d+)\b/);
+    if (maxMatch) {
+      maxCards = parseInt(maxMatch[1], 10);
+      rest = rest.replace(maxMatch[0], '').trim();
+    }
+    // Identify the URL — first http(s) token
+    const tokens = rest.split(/\s+/).filter(Boolean);
+    const urlToken = tokens.find((t) => /^https?:\/\//i.test(t));
+    if (!urlToken) {
+      await ctx.reply('Need a YouTube URL. Example: /cardsfromvideo https://youtu.be/abc123 Bridge::Stayman');
+      return;
+    }
+    if (!isYouTubeUrl(urlToken)) {
+      await ctx.reply(`That doesn't look like a YouTube URL: ${urlToken}`);
+      return;
+    }
+    const deck = tokens.filter((t) => t !== urlToken).join(' ').trim();
+    if (!deck) {
+      await ctx.reply('Need a deck name. Example: /cardsfromvideo <url> Bridge::Stayman');
+      return;
+    }
+    try {
+      await sendCardsFromVideo(ctx, urlToken, {
+        deck,
+        topicHint,
+        maxCards,
+        agentId: AGENT_ID,
+        chatId: ctx.chat!.id.toString(),
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ err: msg, deck, url: urlToken }, 'cards-from-video failed');
+      await ctx.reply(`Could not draft cards from video: ${msg}`);
+    }
+  });
+
+  // /importdeck <url-or-attachment> — fetches a .apkg and imports it.
+  // Telegram-attached .apkg files are detected by the message:document
+  // handler below and routed here automatically — Brian just sends the
+  // file with caption "/importdeck" (or no caption).
+  bot.command('importdeck', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
+    const arg = (ctx.match?.toString() ?? '').trim();
+    if (!arg) {
+      await ctx.reply(
+        'Usage:\n/importdeck https://ankiweb.net/shared/info/<id>\n' +
+          'or attach a .apkg file to a message with caption /importdeck',
+      );
+      return;
+    }
+    if (!/^https?:\/\//i.test(arg)) {
+      await ctx.reply(
+        'For local .apkg files, attach them to a Telegram message instead of pasting a path here.',
+      );
+      return;
+    }
+    try {
+      await ctx.reply(`Downloading deck from ${arg.slice(0, 80)}…`);
+      const result = await importApkg(arg);
+      const syncSuffix = result.syncOk ? ' Synced to AnkiWeb.' : ` (sync: ${result.syncError ?? 'unknown'})`;
+      await ctx.reply(`✅ Imported deck.${syncSuffix} Open Anki Desktop to see the new cards.`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ err: msg, url: arg }, 'import-deck failed');
+      await ctx.reply(`Import failed: ${msg}`);
+    }
+  });
+
+  // /cardsfromdoc <absolute-path> [deck=<n>] [topic=<hint>] [max=<N>]
+  // (Legacy /cardsfromdoc and /importdave removed — superseded by /importdoc
+  // which prompts for deck disposition. Brian was one session into them;
+  // no muscle memory built. /importdoc covers both cases via auto-detect.)
+
+  // /importdoc <absolute-path>
+  //
+  // Unified doc-import flow. Detects format (Dave-KB-formatted HTML vs
+  // generic HTML/MD/text) and prompts: Add / New / Replace / Cancel.
+  // On Add or Replace, lists existing decks. On New, asks for a name
+  // (intercepted by the message:text handler below). Once the deck is
+  // resolved, runs the matching importer.
+  //
+  // Replaces the old /cardsfromdoc and /importdave commands (those were
+  // path+flag style with no disposition prompts).
+  bot.command('importdoc', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
+    const raw = (ctx.match?.toString() ?? '').trim();
+    if (!raw) {
+      await ctx.reply('Usage: /importdoc <absolute-path-to-html-md-or-txt>');
+      return;
+    }
+    if (!raw.startsWith('/')) {
+      await ctx.reply('Path must be absolute (start with /).');
+      return;
+    }
+    try {
+      const staged = beginDocImport({
+        chatId: ctx.chat!.id.toString(),
+        agentId: AGENT_ID,
+        docPath: raw,
+      });
+      await ctx.reply(summarizeDocForUser(staged), {
+        parse_mode: 'Markdown',
+        reply_markup: actionPickKeyboard(staged.staging_id),
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ err: msg, path: raw }, 'importdoc failed at staging');
+      await ctx.reply(`Could not stage import: ${msg}`);
+    }
+  });
+
+  // ── /importdoc callback handlers ────────────────────────────────
+
+  bot.callbackQuery(/^dimp-action:(\d+):(add|new|replace)$/, async (ctx) => {
+    if (!ctx.chat || !isAuthorised(ctx.chat.id)) return;
+    const stagingId = parseInt(ctx.match![1], 10);
+    const action = ctx.match![2] as 'add' | 'new' | 'replace';
+    await ctx.answerCallbackQuery();
+    const staging = getDocImport(stagingId);
+    if (!staging || staging.state === 'completed' || staging.state === 'cancelled') {
+      await ctx.reply('That import is no longer active. Start over with /importdoc.');
+      return;
+    }
+    updateDocImport(stagingId, { action });
+
+    if (action === 'new') {
+      updateDocImport(stagingId, { state: 'awaiting-name' });
+      await ctx.reply(
+        'Reply with the deck name (e.g. `Bridge::DaveSystem`). Use `::` for sub-decks. Send /cancel to abort.',
+        { parse_mode: 'Markdown' },
+      );
+      return;
+    }
+
+    // Add or Replace — fetch existing decks and ask user to pick
+    try {
+      updateDocImport(stagingId, { state: 'awaiting-deck-pick' });
+      const decks = await listExistingDecks();
+      await ctx.reply(
+        action === 'replace'
+          ? 'Pick the deck to replace:'
+          : 'Pick the deck to add cards to:',
+        { reply_markup: deckPickKeyboard(stagingId, decks) },
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ err: msg, stagingId }, 'importdoc deck-list failed');
+      await ctx.reply(`Could not list decks: ${msg}`);
+      updateDocImport(stagingId, { state: 'cancelled' });
+    }
+  });
+
+  bot.callbackQuery(/^dimp-deck:(\d+):(.+)$/, async (ctx) => {
+    if (!ctx.chat || !isAuthorised(ctx.chat.id)) return;
+    const stagingId = parseInt(ctx.match![1], 10);
+    const deck = ctx.match![2];
+    await ctx.answerCallbackQuery({ text: `Target: ${deck}` });
+    const staging = getDocImport(stagingId);
+    if (!staging || staging.state === 'completed' || staging.state === 'cancelled') {
+      await ctx.reply('That import is no longer active.');
+      return;
+    }
+    updateDocImport(stagingId, { targetDeck: deck, state: 'awaiting-mode' });
+    await ctx.reply(`Target deck: "${deck}". How should I commit the cards?`, {
+      reply_markup: modePickKeyboard(stagingId),
+    });
+  });
+
+  bot.callbackQuery(/^dimp-mode:(\d+):(auto|review)$/, async (ctx) => {
+    if (!ctx.chat || !isAuthorised(ctx.chat.id)) return;
+    const stagingId = parseInt(ctx.match![1], 10);
+    const mode = ctx.match![2] as 'auto' | 'review';
+    await ctx.answerCallbackQuery({
+      text: mode === 'auto' ? 'Auto-importing…' : 'Generating previews…',
+    });
+    const staging = getDocImport(stagingId);
+    if (!staging || staging.state === 'completed' || staging.state === 'cancelled') {
+      await ctx.reply('That import is no longer active.');
+      return;
+    }
+    if (!staging.target_deck) {
+      await ctx.reply('No deck selected for this import. Start over with /importdoc.');
+      return;
+    }
+    updateDocImport(stagingId, { reviewMode: mode, state: 'executing' });
+    if (mode === 'auto') {
+      await ctx.reply(`Generating cards from "${staging.doc_path.split('/').pop()}" — this may take a minute…`);
+    }
+    try {
+      await executeDocImport(ctx, stagingId);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ err: msg, stagingId }, 'importdoc execute failed');
+      await ctx.reply(`Import failed: ${msg}`);
+      updateDocImport(stagingId, { state: 'cancelled' });
+    }
+  });
+
+  bot.callbackQuery(/^dimp-cancel:(\d+)$/, async (ctx) => {
+    if (!ctx.chat || !isAuthorised(ctx.chat.id)) return;
+    const stagingId = parseInt(ctx.match![1], 10);
+    await ctx.answerCallbackQuery({ text: 'Cancelled.' });
+    updateDocImport(stagingId, { state: 'cancelled' });
+    await ctx.reply('Import cancelled.');
+  });
+
+  // /previewcard <id> — re-send the preview for a pending card
+  bot.command('previewcard', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    if (await replyIfLocked(ctx)) return;
+    const raw = (ctx.match?.toString() ?? '').trim();
+    if (!/^\d+$/.test(raw)) {
+      await ctx.reply('Usage: /previewcard <id>');
+      return;
+    }
+    const id = parseInt(raw, 10);
+    const card = getPendingCard(id);
+    if (!card) {
+      await ctx.reply(`Pending card ${id} not found.`);
+      return;
+    }
+    await sendPendingPreview(ctx, card);
+  });
+
+  // /cancel — abort any pending /importdoc flow waiting for a deck name
+  bot.command('cancel', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    const chatIdStr = ctx.chat!.id.toString();
+    const active = getActiveDocImport(chatIdStr);
+    if (active) {
+      updateDocImport(active.id, { state: 'cancelled' });
+      await ctx.reply('Import cancelled.');
+    } else {
+      await ctx.reply('Nothing to cancel.');
+    }
+  });
+
+  // /card_help — list every Anki / flashcard command with usage examples.
+  bot.command('card_help', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    const msg = [
+      '<b>📇 Anki card commands</b>',
+      '',
+      '<b>Make cards from a source</b>',
+      '<code>/cardsfromtext &lt;deck&gt; [topic=...] [max=N]</code>',
+      '  &lt;paste your text below on a new line&gt;',
+      '  Example:',
+      '  <code>/cardsfromtext Bridge::Stayman topic=responses max=4</code>',
+      '  Stayman = 2♣ over 1NT, asks for a 4-card major...',
+      '',
+      '<code>/cardsfromvideo &lt;YouTube URL&gt; &lt;deck&gt; [topic=...] [max=N]</code>',
+      '  Gemini reads the video natively. Cards include timestamp citations.',
+      '  Example:',
+      '  <code>/cardsfromvideo https://youtu.be/abc123 Bridge::DaveSystem</code>',
+      '',
+      '<code>/importdoc &lt;absolute-path&gt;</code>',
+      '  Import an MD / HTML / TXT file. Bot will ask: Add to existing deck,',
+      '  Create new deck, or Replace existing → then ⚡Auto-import vs 👀Review each.',
+      '  Example:',
+      '  <code>/importdoc /Users/you/Downloads/dave-bidding.md</code>',
+      '',
+      '<code>/importdeck &lt;ankiweb-url or .apkg attachment&gt;</code>',
+      '  Install an existing Anki deck. No LLM, no approval — straight in.',
+      '',
+      '<code>/newcard &lt;deck&gt;</code>',
+      '  front: &lt;question&gt;',
+      '  back: &lt;answer&gt;',
+      '  Manually propose ONE card.',
+      '',
+      '<b>Review &amp; manage pending cards</b>',
+      '<code>/pending</code> — list cards awaiting approval (with IDs)',
+      '<code>/previewcard &lt;id&gt;</code> — re-send the Canvas preview for a card',
+      '<code>/editcard &lt;id&gt;</code> — edit a pending card\'s fields',
+      '  front: &lt;new question&gt;',
+      '  back: &lt;new answer&gt;',
+      '<code>/cancel</code> — abort an in-flight <code>/importdoc</code> flow',
+      '',
+      '<b>Per-card buttons</b> (under every Canvas preview)',
+      '✅ Approve — commit the card to your Anki collection',
+      '✏️ Edit — change the fields before committing',
+      '❌ Reject — discard this draft',
+      '🔍 Open in Canvas — view full size in the Canvas Mini App',
+      '',
+      '<b>Tips</b>',
+      '• Deck names use <code>::</code> for hierarchy: <code>Bridge::Conventions::Stayman</code>',
+      '• Auto-generated diagrams appear when content is spatial / structural',
+      '• Cards dedup by content hash — re-sending the same source skips duplicates',
+    ].join('\n');
+    await ctx.reply(msg, { parse_mode: 'HTML' });
+  });
+
+  // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
