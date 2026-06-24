@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> **There is now a plugin version of Anki:** [`claudeclaw-anki-plugin`](https://github.com/bostrovsky/claudeclaw-anki-plugin).
+> If your ClaudeClaw OS has the [plugin loader](https://github.com/bostrovsky/claudeclaw-plugins) installed, **use the plugin** — it installs by cloning into `plugins/anki/` with no `sed`-patching of core, and survives upstream upgrades cleanly.
+>
+> This repo is the original `sed`-based installer. It still works on a stock ClaudeClaw OS that does **not** have the plugin loader, and is kept for that case — but the plugin is the recommended path going forward.
+
 # ClaudeClaw Anki
 
 Anki-backed accelerated learning for [ClaudeClaw](https://github.com/openclaw/openclaw) via Telegram. Generate Anki flashcards from text, YouTube videos, MD/HTML documents, or existing `.apkg` decks. Cards land in real Anki Desktop (with AnkiConnect), reviewed through Canvas Mini App previews, with optional auto-generated diagrams via Gemini 2.5 Flash Image ("Nano Banana").
